@@ -1,0 +1,27 @@
+__default__:
+  jobname: "{rule}.{wildcards.prefix_2}"
+  nodes: 1
+  ntaskspernode: 1
+  cpuspertask: 1
+  time: "12:00:00"
+  account: "DURBIN-SL2-CPU"
+  partition: "icelake"
+  mailtype: "FAIL"
+  output: ".slurm/%x_%A.out"
+
+
+merge_view_collate_fastq_bwa:
+  partition: "icelake-himem"
+  cpuspertask: 4
+
+fixmate_sort_markdup_view:
+  cpuspertask: 4
+  
+newheader:
+  cpuspertask: 1
+
+crumblecompress:
+  cpuspertask: 1
+
+crumble_index_stats:
+  cpuspertask: 1
