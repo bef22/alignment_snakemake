@@ -1,0 +1,278 @@
+"""
+Snakemake script for using bwa-mem to map or realigning pair-read data from bam/cram files to a reference genome.
+
+CREATE
+a tab delimited fofn file which contains 3 columns as follows:
+1. full path to the bam/cram file containing the reads, e.g. /home/bef22/rds/rds-durbin-group-8b3VcZwY7rY/projects/cichlid/alignments/Malawi_cichlids_2017/cichlid6978769/fAstCal1.2/cichlid6978769.mem.crumble.cram
+2. is the primaryID which is used to name the final cram file, e.g. cichlid6978769 which is called "prefix_2" in the script below
+3. is the subfolder name, e.g. MayCal which is called "prefix_1" in the script belowm, this is used in creation of the final result path, it can be the same as the primaryID
+
+
+UPDATE
+the following parameters in the script below:
+1. "user" is the CRSid of the person running the script; this is so snakemake can get the relative paths correctly. E.g. mine is bef22
+2. "path_to_files_info" which is the path to input fofn file describing the data (see above), e.g. /home/bef22/rds/rds-durbin-group-8b3VcZwY7rY/projects/cichlid/alignments/snakemake_scripts/221108_using_profile/test.fofn
+3. "output_folder" which is the path to output directory where new files will be written, this should be in cichlids/alignments/...
+4. "remap_flag" set this to "no" for read name sorted cram files and "yes" for position sorted cram files
+5. "reference" path to genome reference to which to align the samples 
+6. "reference_string" is the short alias to use for this genome referenece
+
+
+RUN
+in a screen terminal and load the following modules
+module purge
+module load rhel8/default-icl
+module load htslib/1.14/gcc/wwc5wqv5
+module load gcc/11.3.0/gcc/4zpip55j
+
+check how many jobs are required
+- snakemake -n
+
+run the pipeline, replace n with the total number of jobs, provide the full path to the profile folder, latency is a delay for finish writing files
+- snakemake --profile /rds/project/rd109/rds-rd109-durbin-group/projects/cichlid/alignments/snakemake_scripts/profile_icelake/ --latency 20 --jobs 20
+
+
+INFO
+fixed all software paths to /rds/rds-durbin-group-8b3VcZwY7rY/software_RHEL8/bin
+
+
+AUTHORS and UPDATES
+Written by Trevor Cousins (tc557), 6th July 2022. 
+Updated by Bettina Fischer (bef22), 8th November 2022 
+	- implemented the samtools collate step to remap already aligned data
+	- now using profile to assign cluster parameters (cpu) per rule
+	- updated to crumble-0.9.0 (this readquires the htslib-1.9-gcc-5.4.0-p2taavl module)
+	- changed the slurm submission names to reflect rule.sampleID.slurmID
+	- flag files instead of log files
+Updated by Bettina Fischer (bef22), 9th November 2022
+	- updated to bwa-mem2
+Updated by Bettina Fischer (bef22), 23th November 2022
+	-revert to bwa-mem as bwa-mem has some bugs
+Updated by Bettina Fischer (bef22), May 2024 
+  - updated to to icelake RHEL8 nodes
+  - crumble-0.9.1 (this requires the htslib/1.14/gcc/wwc5wqv5 module)
+
+"""
+
+import pdb 
+import subprocess
+import os
+
+
+###############################################################################
+### update these 7 variables
+user = 'CRSid'                        # change to the CRSid of whoever is running the snakefile
+who_wrote_input_files_info = 'CRSid'  # CRSid used in the first column of the fofn file
+
+path_to_files_info = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/projects/cichlid/alignments/snakemake_scripts/240524_DURB_000024-Malawi/durb_000024_batch1.fofn'
+output_folder = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/projects/cichlid/alignments/DURB_000024-Malawi'
+
+remap_flag = 'no'                    # 'no' cram files are read name sorted
+#remap_flag = 'yes'					  # 'yes' cram files are position sorted, e.g. from already aligned files
+
+# select the reference, these must be bwa-mem indexed!!!
+reference = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/ref/fish/Astatotilapia_calliptera/fAstCal1.2/GCA_900246225.3_fAstCal1.2_genomic_chromnames_mt.fa'
+reference_string = 'fAstCal1.2'
+
+#reference = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/ref/fish/Maylandia_zebra/M_zebra_UMD2a/GCF_000238955.4_M_zebra_UMD2a_genomic_LG.fa'
+#reference_string = 'Mzebra_UMD2a'
+
+
+
+###############################################################################
+### the following shouldn't be changed to ensure working software versions are used
+samtools_path = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/software_RHEL8/bin/samtools'
+bwa_path = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/software_RHEL8/bin/bwa'
+crumble_path = f'/home/{user}/rds/rds-durbin-group-8b3VcZwY7rY/software_RHEL8/bin/crumble'
+
+
+# create the .slurm directory
+if not os.path.exists('.slurm'):
+    os.makedirs('.slurm')
+
+
+# get list of sample names; read the input file
+with open(path_to_files_info) as f:
+    lines = f.readlines()
+sample_path_prefix = []
+samples = []
+for line in lines:
+    line = line[0:-1] # remove new line character
+    files = line.split('\t')
+    # sample_current = files[0].split('/')[9]
+    first_prefix = files[2]
+    second_prefix = files[1]
+    sample_path_prefix.append((first_prefix,second_prefix,reference_string)) # 0 for 1st prefix, 1 for 2nd prefix, 2 for reference
+
+
+# get the read group from a particular input file and change the SM sangerID to primaryID
+def get_sample_RG_and_update(wildcards):
+     # get infile(s) path
+    file_path = get_in_file_for_rule_merge_view_collate_fastq_bwa(wildcards)
+    if len(file_path)>1: # if more than one file 
+        infile = ' '.join(file_path)
+    else:
+        infile = file_path[0]
+    bashcommand = f"{samtools_path} merge -ur - {infile} | {samtools_path} view -H - | grep -E '^@RG' | perl -pe 's/SM:[^\t]+/SM:{wildcards.prefix_2}/'"
+    
+    stream = os.popen(bashcommand)
+    RG_string = stream.readlines()
+    RG_string = [RG_string[i].replace('\n','') for i in range(0,len(RG_string))]
+    RG_string = [RG_string[i].replace('\t','\\t') for i in range(0,len(RG_string))]
+
+    if len(RG_string)>1:
+        RG_string = '\\n'.join(RG_string)
+    else:
+        RG_string = RG_string[0]
+    speech_mark = '"'
+
+    RG = f'{speech_mark}{RG_string}{speech_mark}'
+    print(f'RG for (prefix_1,prefix_2) is {wildcards.prefix_1,wildcards.prefix_2} is \n{RG}')
+    print()
+
+    return RG
+    
+    
+# get the read group from a particular input file and keep the SM id
+def get_sample_RG(wildcards):
+     # get infile(s) path
+    file_path = get_in_file_for_rule_merge_view_collate_fastq_bwa(wildcards)
+    if len(file_path)>1: # if more than one file 
+        infile = ' '.join(file_path)
+    else:
+        infile = file_path[0]
+    bashcommand = f"{samtools_path} merge -ur - {infile} | {samtools_path} view -H - | grep -E '^@RG'"
+    
+    stream = os.popen(bashcommand)
+    RG_string = stream.readlines()
+    RG_string = [RG_string[i].replace('\n','') for i in range(0,len(RG_string))]
+    RG_string = [RG_string[i].replace('\t','\\t') for i in range(0,len(RG_string))]
+
+    if len(RG_string)>1:
+        RG_string = '\\n'.join(RG_string)
+    else:
+        RG_string = RG_string[0]
+    speech_mark = '"'
+
+    RG = f'{speech_mark}{RG_string}{speech_mark}'
+    print(f'RG for (prefix_1,prefix_2) is {wildcards.prefix_1,wildcards.prefix_2} is \n{RG}')
+    print()
+
+    return RG
+    
+
+
+# get string of input file
+def get_in_file_for_rule_merge_view_collate_fastq_bwa(wildcards):
+
+    with open(path_to_files_info) as f:
+        lines = f.readlines()
+    for line in lines:
+        line = line[0:-1] # remove new line character
+        files = line.split('\t')
+        # sample_current = files[0].split('/')[9]
+        first_prefix = files[2]
+        second_prefix = files[1]
+        if first_prefix == wildcards.prefix_1 and second_prefix == wildcards.prefix_2:
+            infile = files[0]
+            infile = infile.replace(who_wrote_input_files_info,user)
+            if ' ' in infile: # multiple input files
+                # pdb.set_trace()
+                infile = infile.split(' ')
+            else:
+                infile = [infile]
+    return infile
+
+
+# rules not passed to SLURM
+localrules: all
+
+
+rule all:
+    input:
+        [f'{output_folder}/{sample_path_prefix[i][0]}/{sample_path_prefix[i][2]}/{sample_path_prefix[i][1]}.mem.crumble.cram_stats' for i in range(0,len(sample_path_prefix))] # prefix_1, ref, prefix_2
+
+
+rule merge_view_collate_fastq_bwa:
+    input:
+        get_in_file_for_rule_merge_view_collate_fastq_bwa,
+    output:
+        outfile = temp('{output_folder}/{prefix_1}/{ref}/{prefix_2}.sam'),
+        flagfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.merge_view_collate_fastq_bwa.flag'
+    run:
+        if remap_flag == "yes":
+            shell(
+                f'{samtools_path} merge -ur - {" ".join(get_in_file_for_rule_merge_view_collate_fastq_bwa(wildcards))} | {samtools_path} view -uF0xB00 - | {samtools_path} collate -Oun100 - {output.outfile}.collate | {samtools_path} fastq -Ont - | {bwa_path} mem -t 12 -Cp -H {get_sample_RG(wildcards)} {reference} - > {output.outfile}'
+                )
+            shell("touch {output.flagfile}")
+        if remap_flag == "no":
+            shell(
+                f'{samtools_path} merge -ur - {" ".join(get_in_file_for_rule_merge_view_collate_fastq_bwa(wildcards))} | {samtools_path} view -uF0xB00 - | {samtools_path} fastq -Ont - | {bwa_path} mem -t 12 -Cp -H {get_sample_RG_and_update(wildcards)} {reference} - > {output.outfile}'
+                )
+            shell("touch {output.flagfile}")
+
+
+rule fixmate_sort_markdup_view:
+    input:
+        infile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.sam'
+    output:
+        outfile = temp('{output_folder}/{prefix_1}/{ref}/{prefix_2}_OH.cram.part'),
+        flagfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.fixmate_sort_markdup_view.flag'
+    run:
+        shell(
+            f'{samtools_path} fixmate --threads 12 -u -m {input.infile} - | {samtools_path} sort --threads 12 -l 0 -T {input.infile}.sort -o - | {samtools_path} markdup --threads 12 -u -S -T {input.infile}.markdup - - | {samtools_path} view -C --threads 4 -T {reference} -o {output.outfile}'
+        )
+        shell("touch {output.flagfile}")
+
+rule newheader: 
+    input:
+        infile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}_OH.cram.part',
+    output:
+        outfile = temp('{output_folder}/{prefix_1}/{ref}/{prefix_2}_NH.cram'),
+        flagfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.newheader.flag'
+    run:
+        shell(
+            f'cat {reference}.dict > {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_1.txt' 
+        )
+        shell(
+            f'{samtools_path} view -H {input.infile} | grep -v ^\@SQ > {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_2.txt'
+        )
+        shell(
+            'cat {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_1.txt >> {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_2.txt'
+        )
+        shell(
+            f'{samtools_path} reheader {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_2.txt {input.infile} > {output.outfile}')
+        shell(
+            'rm {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_1.txt'
+        )
+        shell(
+            'rm {wildcards.output_folder}/{wildcards.prefix_1}/{wildcards.ref}/{wildcards.prefix_2}_hdr_2.txt'
+        )
+        shell("touch {output.flagfile}")
+        
+
+rule crumblecompress:
+    input: 
+        infile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}_NH.cram'
+    output: 
+        outfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.mem.crumble.cram',
+        flagfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.crumblecompress.flag'
+    run:
+        shell(
+                f'{crumble_path} -O cram {input.infile} {output.outfile}'
+        )
+        shell("touch {output.flagfile}")
+
+rule crumble_index_stats:
+    input:
+        infile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.mem.crumble.cram'
+    output:
+        outfile = '{output_folder}/{prefix_1}/{ref}/{prefix_2}.mem.crumble.cram_stats'
+    run:
+        shell(
+            f'{samtools_path} stats -F0xb00  {input.infile} > {output.outfile}',
+            )
+        shell(
+                f'{samtools_path} index {input.infile}'
+            )
+
