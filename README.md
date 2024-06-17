@@ -64,6 +64,10 @@ set the following parameters
 open a screen terminal (take a not of the login node so you can attach back to the same later)
 ```
 screen -RD
+module purge
+module load rhel8/default-icl
+module load htslib/1.14/gcc/wwc5wqv5
+module load gcc/11.3.0/gcc/4zpip55j
 ```
 
 To check how many jobs are required and display the shell commands use:
